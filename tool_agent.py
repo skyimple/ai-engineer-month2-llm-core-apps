@@ -1,6 +1,7 @@
 """
 Terminal Tool-Calling Agent using DeepSeek with streaming support.
 Provides 3 tools: weather, calculator, and notes search.
+Features: Multi-turn chat, cost tracking, auto-retry, special commands.
 """
 
 import ast
@@ -9,11 +10,13 @@ import os
 import re
 import sys
 import urllib.request
+from dataclasses import dataclass, field
 from typing import Any
 
 import instructor
 from openai import OpenAI
 from dotenv import load_dotenv
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from models import Invoice
 
@@ -24,6 +27,126 @@ client = OpenAI(
     base_url="https://api.deepseek.com"
 )
 instructor_client = instructor.from_openai(client)
+
+
+# =============================================================================
+# DeepSeek Pricing & Cost Tracker
+# =============================================================================
+
+DEEPSEEK_PRICING = {
+    "input": 2.0,   # RMB per million tokens
+    "output": 3.0,  # RMB per million tokens
+}
+
+
+class CostTracker:
+    """Tracks token usage and calculates accumulated cost in RMB."""
+
+    def __init__(self):
+        self.total_prompt_tokens = 0
+        self.total_completion_tokens = 0
+        self.total_cost = 0.0
+
+    def update(self, usage: dict):
+        """Update totals from an API response usage dict."""
+        prompt_tokens = usage.get("prompt_tokens", 0)
+        completion_tokens = usage.get("completion_tokens", 0)
+
+        self.total_prompt_tokens += prompt_tokens
+        self.total_completion_tokens += completion_tokens
+
+        # Calculate cost in RMB
+        prompt_cost = (prompt_tokens / 1_000_000) * DEEPSEEK_PRICING["input"]
+        completion_cost = (completion_tokens / 1_000_000) * DEEPSEEK_PRICING["output"]
+        self.total_cost = (self.total_prompt_tokens / 1_000_000) * DEEPSEEK_PRICING["input"] + \
+                          (self.total_completion_tokens / 1_000_000) * DEEPSEEK_PRICING["output"]
+
+    def display(self) -> str:
+        """Return a formatted string showing usage and cost."""
+        total_tokens = self.total_prompt_tokens + self.total_completion_tokens
+        return (
+            f"\n{'=' * 40}\n"
+            f"Token Usage Summary\n"
+            f"{'=' * 40}\n"
+            f"Prompt tokens:      {self.total_prompt_tokens:,}\n"
+            f"Completion tokens:  {self.total_completion_tokens:,}\n"
+            f"Total tokens:       {total_tokens:,}\n"
+            f"Estimated cost:     {self.total_cost:.4f} RMB\n"
+            f"{'=' * 40}\n"
+        )
+
+
+# =============================================================================
+# Conversation Memory
+# =============================================================================
+
+@dataclass
+class ConversationMemory:
+    """Stores full conversation history with token/cost tracking."""
+    system_prompt: str
+    messages: list[dict] = field(default_factory=list)
+    cost_tracker: CostTracker = field(default_factory=CostTracker)
+
+    def __post_init__(self):
+        # Initialize with system prompt
+        self.messages = [
+            {"role": "system", "content": self.system_prompt}
+        ]
+
+    def add_user(self, content: str):
+        """Add a user message."""
+        self.messages.append({"role": "user", "content": content})
+
+    def add_assistant(self, content: str | None = None, tool_calls: list | None = None):
+        """Add an assistant message."""
+        msg = {"role": "assistant"}
+        if content:
+            msg["content"] = content
+        if tool_calls:
+            msg["tool_calls"] = tool_calls
+        self.messages.append(msg)
+
+    def add_tool_result(self, tool_call_id: str, content: str):
+        """Add a tool result message."""
+        self.messages.append({
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "content": content
+        })
+
+    def update_usage(self, usage: dict):
+        """Update cost tracker with API usage."""
+        self.cost_tracker.update(usage)
+
+    def display_history(self) -> str:
+        """Return formatted conversation history with message numbers."""
+        lines = []
+        lines.append("\n" + "=" * 50)
+        lines.append("Conversation History")
+        lines.append("=" * 50)
+
+        for i, msg in enumerate(self.messages):
+            role = msg["role"]
+            if role == "system":
+                content = msg["content"][:100] + "..." if len(msg["content"]) > 100 else msg["content"]
+                lines.append(f"[{i}] SYSTEM: {content}")
+            elif role == "user":
+                lines.append(f"[{i}] USER: {msg['content']}")
+            elif role == "assistant":
+                if msg.get("tool_calls"):
+                    tc_names = [tc["function"]["name"] for tc in msg["tool_calls"]]
+                    lines.append(f"[{i}] ASSISTANT (tools: {', '.join(tc_names)})")
+                else:
+                    content = msg.get("content", "")
+                    content = content[:100] + "..." if len(content) > 100 else content
+                    lines.append(f"[{i}] ASSISTANT: {content}")
+            elif role == "tool":
+                content = msg["content"][:80] + "..." if len(msg["content"]) > 80 else msg["content"]
+                lines.append(f"[{i}] TOOL (id={msg['tool_call_id']}): {content}")
+            lines.append("-" * 40)
+
+        lines.append(f"\nTotal messages: {len(self.messages)}")
+        return "\n".join(lines)
 
 
 # =============================================================================
@@ -248,16 +371,22 @@ def execute_tool(tool_name: str, tool_args: dict) -> str:
 # Streaming Handler
 # =============================================================================
 
-def process_streaming_response(stream) -> tuple[str, list | None]:
+def process_streaming_response(stream) -> tuple[str, list | None, dict | None]:
     """
     Process a streaming response from DeepSeek.
-    Returns (full_content, tool_calls_to_execute).
+    Returns (full_content, tool_calls_to_execute, usage).
     tool_calls_to_execute is None if no tool calls, otherwise list of {id, name, arguments}.
+    usage is the usage dict from the API response (only available on final chunk).
     """
     content_accumulator = ""
     tool_calls_accumulator = {}  # index -> {id, name, arguments}
+    usage = None
 
     for chunk in stream:
+        # Extract usage from the last chunk if available
+        if hasattr(chunk, 'usage') and chunk.usage:
+            usage = chunk.usage
+
         delta = chunk.choices[0].delta
 
         # Accumulate content
@@ -303,7 +432,40 @@ def process_streaming_response(stream) -> tuple[str, list | None]:
                 "arguments": args
             })
 
-    return content_accumulator, tool_calls_to_execute
+    return content_accumulator, tool_calls_to_execute, usage
+
+
+# =============================================================================
+# Retry-enabled API call
+# =============================================================================
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type((TimeoutError, Exception)),
+    reraise=True
+)
+def create_chat_completion(messages: list, tools: list, tool_choice: str = "auto"):
+    """
+    Create a chat completion with automatic retry on transient errors.
+    Retries on: 429 (rate limit), 500 (server error), timeout.
+    """
+    try:
+        stream = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=messages,
+            tools=tools,
+            tool_choice=tool_choice,
+            stream=True
+        )
+        return stream
+    except Exception as e:
+        error_str = str(e).lower()
+        # Retry on rate limit (429) or server error (500)
+        if "429" in error_str or "500" in error_str or "timeout" in error_str or "rate" in error_str:
+            raise
+        # Re-raise on other errors
+        raise
 
 
 # =============================================================================
@@ -312,10 +474,8 @@ def process_streaming_response(stream) -> tuple[str, list | None]:
 
 def run_agent():
     """Run the interactive terminal agent loop."""
-    messages = [
-        {
-            "role": "system",
-            "content": """You are a helpful assistant with access to tools. When a user asks a question:
+
+    system_prompt = """You are a helpful assistant with access to tools. When a user asks a question:
 
 1. If they ask about weather, use the get_weather tool with the city name.
 2. If they ask to calculate or compute something, use the calculator tool.
@@ -323,12 +483,13 @@ def run_agent():
 4. If they want to parse an invoice, carefully extract the details from the invoice text they provide.
 
 Be concise and helpful in your responses."""
-        }
-    ]
+
+    memory = ConversationMemory(system_prompt=system_prompt)
 
     print("=" * 60)
     print("Terminal Tool-Calling Agent (DeepSeek)")
     print("Tools: get_weather, calculator, search_notes")
+    print("Commands: 'cost' - show usage | 'history' - show conversation")
     print("Type 'exit' or 'quit' to end the session.")
     print("=" * 60)
     print()
@@ -347,39 +508,63 @@ Be concise and helpful in your responses."""
             print("Goodbye!")
             break
 
-        # Append user message
-        messages.append({"role": "user", "content": user_input})
+        # Handle special commands
+        if user_input.lower() == "cost":
+            print(memory.cost_tracker.display())
+            continue
 
-        # Send to DeepSeek with streaming
+        if user_input.lower() == "history":
+            print(memory.display_history())
+            print()
+            continue
+
+        # Add user message to memory
+        memory.add_user(user_input)
+
+        # Send to DeepSeek with streaming and retry
         try:
-            stream = client.chat.completions.create(
-                model="deepseek-chat",
-                messages=messages,
+            stream = create_chat_completion(
+                messages=memory.messages,
                 tools=TOOLS,
-                tool_choice="auto",
-                stream=True
+                tool_choice="auto"
             )
 
-            full_content, tool_calls = process_streaming_response(stream)
+            full_content, tool_calls, usage = process_streaming_response(stream)
+
+            # Update cost tracking
+            if usage:
+                memory.update_usage({
+                    "prompt_tokens": usage.prompt_tokens,
+                    "completion_tokens": usage.completion_tokens
+                })
+                total_tokens = usage.prompt_tokens + usage.completion_tokens
+                print(f"\n[Tokens used: {total_tokens}]")
 
             # Build assistant message with content and/or tool_calls
-            if full_content or tool_calls:
-                assistant_msg = {"role": "assistant"}
-                if full_content:
-                    assistant_msg["content"] = full_content
-                if tool_calls:
-                    assistant_msg["tool_calls"] = [
-                        {
-                            "id": tc["id"],
-                            "type": "function",
-                            "function": {
-                                "name": tc["name"],
-                                "arguments": json.dumps(tc["arguments"])
-                            }
+            # IMPORTANT: when tool_calls exist, content should be None (not empty string)
+            if tool_calls:
+                # Assistant message with tool calls only (no content)
+                assistant_tool_calls = [
+                    {
+                        "id": tc["id"],
+                        "type": "function",
+                        "function": {
+                            "name": tc["name"],
+                            "arguments": json.dumps(tc["arguments"])
                         }
-                        for tc in tool_calls
-                    ]
-                messages.append(assistant_msg)
+                    }
+                    for tc in tool_calls
+                ]
+                memory.messages.append({
+                    "role": "assistant",
+                    "tool_calls": assistant_tool_calls
+                })
+            elif full_content:
+                # Assistant message with content only (no tool calls)
+                memory.messages.append({
+                    "role": "assistant",
+                    "content": full_content
+                })
 
             # Handle tool calls
             if tool_calls:
@@ -389,28 +574,33 @@ Be concise and helpful in your responses."""
                     print(f"[Tool result]: {result}\n")
 
                     # Append tool result as a special message
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc["id"],
-                        "content": result
-                    })
+                    memory.add_tool_result(tc["id"], result)
 
                 # Continue: get the model's response to tool results
                 print("[Model is thinking...]\n")
-                stream = client.chat.completions.create(
-                    model="deepseek-chat",
-                    messages=messages,
+                stream = create_chat_completion(
+                    messages=memory.messages,
                     tools=TOOLS,
-                    tool_choice="auto",
-                    stream=True
+                    tool_choice="auto"
                 )
-                full_content, _ = process_streaming_response(stream)
+                full_content, _, usage = process_streaming_response(stream)
+
+                if usage:
+                    memory.update_usage({
+                        "prompt_tokens": usage.prompt_tokens,
+                        "completion_tokens": usage.completion_tokens
+                    })
+                    total_tokens = usage.prompt_tokens + usage.completion_tokens
+                    print(f"\n[Tokens used: {total_tokens}]")
+
                 if full_content:
-                    messages.append({"role": "assistant", "content": full_content})
+                    memory.add_assistant(full_content)
 
         except Exception as e:
             print(f"Error: {str(e)}")
-            messages.pop()  # Remove the failed user message
+            # Remove the failed user message from memory
+            if memory.messages and memory.messages[-1]["role"] == "user":
+                memory.messages.pop()
             continue
 
         print()
