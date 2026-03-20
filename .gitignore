@@ -1,0 +1,22 @@
+# Environment (contains API keys)
+config.env
+
+# Generated outputs
+invoices.json
+
+# Python build artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# IDE / Claude
+.claude/
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
