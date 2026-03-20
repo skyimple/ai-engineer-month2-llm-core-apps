@@ -9,4 +9,4 @@ dependencies = [
 ]
 
 [tool.setuptools]
-py-modules = ["client", "invoices", "main", "models", "parser"]
+py-modules = ["client", "invoices", "main", "models", "parser", "tool_agent"]
